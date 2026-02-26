@@ -2854,7 +2854,9 @@ _SPI_execute_plan(SPIPlanPtr plan, const SPIExecuteOptions *options,
 		 * DDL that would affect the next CachedPlanSource.
 		 */
 		if (!options->read_only)
+		{
 			CommandCounterIncrement();
+		}
 	}
 
 fail:

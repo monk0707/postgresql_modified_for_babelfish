@@ -4188,7 +4188,12 @@ ExecModifyTable(PlanState *pstate)
 
 		/* No more tuples to process? */
 		if (TupIsNull(context.planSlot))
+		{
+			/* Drop the slot before breaking out of the loop */
+			if (tsql_insert_exec)
+				ExecDropSingleTupleTableSlot(context.planSlot);
 			break;
+		}
 
 		/*
 		 * When there are multiple result relations, each tuple contains a

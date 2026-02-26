@@ -78,6 +78,7 @@
 
 check_lang_as_clause_hook_type check_lang_as_clause_hook = NULL;
 write_stored_proc_probin_hook_type write_stored_proc_probin_hook = NULL;
+is_insert_exec_rewrite_active_hook_type is_insert_exec_rewrite_active_hook = NULL;
 
 /*
  *	 Examine the RETURNS clause of the CREATE FUNCTION statement
@@ -2466,9 +2467,9 @@ ExecuteCallStmt(CallStmt *stmt, ParamListInfo params, bool atomic, DestReceiver 
 		ListCell *list_cell;
 		ListCell *next;
 
-		/* look up the INSERT target relation rowtype's tupdesc */
+		/* look up the INSERT target relation rowtype's tupdesc - use _copy to avoid pinning */
 		reltypeid = get_rel_type_id(stmt->relation);
-		reldesc = lookup_rowtype_tupdesc(reltypeid, -1);
+		reldesc = lookup_rowtype_tupdesc_copy(reltypeid, -1);
 
 		/* build a tupdesc that only contains relevant INSERT columns */
 		retdesc = CreateTemplateTupleDesc(list_length(stmt->attrnos));
@@ -2478,6 +2479,9 @@ ExecuteCallStmt(CallStmt *stmt, ParamListInfo params, bool atomic, DestReceiver 
 			TupleDescCopyEntry(retdesc, natts, reldesc, lfirst_int(list_cell));
 			next = lnext(stmt->attrnos, list_cell);
 		}
+
+		/* Free the copied TupleDesc - we've copied what we need */
+		FreeTupleDesc(reldesc);
 
 		fcinfo->resultinfo = (Node *) &rsinfo;
 		rsinfo.type = T_ReturnSetInfo;
@@ -2514,6 +2518,7 @@ ExecuteCallStmt(CallStmt *stmt, ParamListInfo params, bool atomic, DestReceiver 
 	/* Here we actually call the procedure */
 	pgstat_init_function_usage(fcinfo, &fcusage);
 	retval = FunctionCallInvoke(fcinfo);
+
 	if (pltsql_pgstat_end_function_usage_hook)
 	{
 		(*pltsql_pgstat_end_function_usage_hook)(fcinfo,  &fcusage, PROKIND_FUNCTION, true);
@@ -2561,46 +2566,70 @@ ExecuteCallStmt(CallStmt *stmt, ParamListInfo params, bool atomic, DestReceiver 
 		TupOutputState *tstate;
 		TupleTableSlot *slot;
 
-		if (fcinfo->isnull)
-			elog(ERROR, "procedure returned null record");
-
 		/*
-		 * Ensure there's an active snapshot whilst we execute whatever's
-		 * involved here.  Note that this is *not* sufficient to make the
-		 * world safe for TOAST pointers to be included in the returned data:
-		 * the referenced data could have gone away while we didn't hold a
-		 * snapshot.  Hence, it's incumbent on PLs that can do COMMIT/ROLLBACK
-		 * to not return TOAST pointers, unless those pointers were fetched
-		 * after the last COMMIT/ROLLBACK in the procedure.
-		 *
-		 * XXX that is a really nasty, hard-to-test requirement.  Is there a
-		 * way to remove it?
+		 * In INSERT EXEC context with query rewriting, the procedure's OUTPUT
+		 * parameters are handled separately via execute_call_insert_exec_retval.
+		 * We should NOT send the OUTPUT parameter values to the client/destination
+		 * because they would be incorrectly inserted into the target table.
+		 * 
+		 * When fcinfo->isnull is true in INSERT EXEC context, it means the
+		 * procedure intentionally returned NULL to prevent the OUTPUT parameters
+		 * from being inserted. This is the expected behavior.
 		 */
-		EnsurePortalSnapshotExists();
+		if (fcinfo->isnull)
+		{
+			if (is_insert_exec_rewrite_active_hook && 
+				is_insert_exec_rewrite_active_hook())
+			{
+				/* In INSERT EXEC context, null return is expected - skip sending to client */
+			}
+			else
+			{
+				elog(ERROR, "procedure returned null record");
+			}
+		}
+		else
+		{
+			/*
+			 * Ensure there's an active snapshot whilst we execute whatever's
+			 * involved here.  Note that this is *not* sufficient to make the
+			 * world safe for TOAST pointers to be included in the returned data:
+			 * the referenced data could have gone away while we didn't hold a
+			 * snapshot.  Hence, it's incumbent on PLs that can do COMMIT/ROLLBACK
+			 * to not return TOAST pointers, unless those pointers were fetched
+			 * after the last COMMIT/ROLLBACK in the procedure.
+			 *
+			 * XXX that is a really nasty, hard-to-test requirement.  Is there a
+			 * way to remove it?
+			 */
+			EnsurePortalSnapshotExists();
 
-		td = DatumGetHeapTupleHeader(retval);
-		tupType = HeapTupleHeaderGetTypeId(td);
-		tupTypmod = HeapTupleHeaderGetTypMod(td);
-		retdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+			td = DatumGetHeapTupleHeader(retval);
+			tupType = HeapTupleHeaderGetTypeId(td);
+			tupTypmod = HeapTupleHeaderGetTypMod(td);
+			retdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
 
-		tstate = begin_tup_output_tupdesc(dest, retdesc,
-										  &TTSOpsHeapTuple);
+			tstate = begin_tup_output_tupdesc(dest, retdesc,
+											  &TTSOpsHeapTuple);
 
-		rettupdata.t_len = HeapTupleHeaderGetDatumLength(td);
-		ItemPointerSetInvalid(&(rettupdata.t_self));
-		rettupdata.t_tableOid = InvalidOid;
-		rettupdata.t_data = td;
+			rettupdata.t_len = HeapTupleHeaderGetDatumLength(td);
+			ItemPointerSetInvalid(&(rettupdata.t_self));
+			rettupdata.t_tableOid = InvalidOid;
+			rettupdata.t_data = td;
 
-		slot = ExecStoreHeapTuple(&rettupdata, tstate->slot, false);
-		tstate->dest->receiveSlot(slot, tstate->dest);
+			slot = ExecStoreHeapTuple(&rettupdata, tstate->slot, false);
+			tstate->dest->receiveSlot(slot, tstate->dest);
 
-		end_tup_output(tstate);
+			end_tup_output(tstate);
 
-		ReleaseTupleDesc(retdesc);
+			ReleaseTupleDesc(retdesc);
+		}
 	}
 	else
+	{
 		elog(ERROR, "unexpected result type for procedure: %u",
 			 fexpr->funcresulttype);
+	}
 
 	FreeExecutorState(estate);
 }
